@@ -935,6 +935,135 @@ class TestGWSignalGenerator(unittest.TestCase):
         # Ensure sampling_frequency and duration have different values in our test
         assert wfg.sampling_frequency != wfg.duration
 
+    _bbh_parameters = dict(
+        mass_1=10.0,
+        mass_2=10.0,
+        theta_jn=1.0,
+        luminosity_distance=1.0,
+        phase=0.0,
+    )
+
+    @staticmethod
+    def _mock_frequency_sequence():
+        def generate(parameters, generator, frequencies):
+            hp = (1 + 1j) * np.asarray(frequencies)
+            return mock.Mock(hp=mock.Mock(value=hp), hc=mock.Mock(value=2 * hp))
+
+        return mock.patch(
+            "lalsimulation.gwsignal.GenerateFDWaveformSequence", side_effect=generate, create=True
+        )
+
+    def test_frequency_sequence_arguments_not_passed_to_gwsignal(self):
+        wfg = self.get_wfgen(
+            spinning=False,
+            waveform_arguments=dict(
+                waveform_approximant="IMRPhenomD",
+                frequencies=np.array([20.0, 30.0]),
+                frequency_bin_edges=np.array([20.0, 30.0]),
+                fiducial=0,
+            ),
+        )
+        gwsignal_dict = wfg._from_bilby_parameters(**self._bbh_parameters)
+        for key in ["frequencies", "frequency_bin_edges", "fiducial"]:
+            assert key not in gwsignal_dict
+
+    def test_multibanding_frequencies_use_frequency_sequence(self):
+        frequencies = np.array([10.0, 20.0, 50.0, 100.0, 120.0])
+        wfg = self.get_wfgen(
+            spinning=False,
+            waveform_arguments=dict(
+                waveform_approximant="IMRPhenomD",
+                minimum_frequency=20.0,
+                maximum_frequency=100.0,
+                frequencies=frequencies,
+            ),
+        )
+        with self._mock_frequency_sequence() as sequence:
+            wf = wfg.frequency_domain_strain(self._bbh_parameters)
+        sequence.assert_called_once()
+        np.testing.assert_array_equal(sequence.call_args.kwargs["frequencies"], frequencies)
+        expected = (1 + 1j) * frequencies * (frequencies >= 20) * (frequencies <= 100)
+        np.testing.assert_array_equal(wf["plus"], expected)
+        np.testing.assert_array_equal(wf["cross"], 2 * expected)
+
+    def test_multibanding_without_minimum_frequency_starts_at_lowest_frequency(self):
+        frequencies = np.array([10.0, 20.0, 50.0])
+        wfg = self.get_wfgen(
+            spinning=False,
+            waveform_arguments=dict(waveform_approximant="IMRPhenomD", frequencies=frequencies),
+        )
+        gwsignal_dict = wfg._from_bilby_parameters(**self._bbh_parameters)
+        assert gwsignal_dict["f22_start"].value == 10.0
+        with self._mock_frequency_sequence():
+            wf = wfg.frequency_domain_strain(self._bbh_parameters)
+        np.testing.assert_array_equal(wf["plus"], (1 + 1j) * frequencies)
+
+    def test_relative_binning_uses_frequency_sequence_except_for_fiducial(self):
+        bin_edges = np.array([20.0, 40.0, 80.0])
+        wfg = self.get_wfgen(
+            spinning=False,
+            waveform_arguments=dict(waveform_approximant="IMRPhenomD", frequency_bin_edges=bin_edges, fiducial=0),
+        )
+        with self._mock_frequency_sequence() as sequence:
+            wf = wfg.frequency_domain_strain(self._bbh_parameters)
+            np.testing.assert_array_equal(sequence.call_args.kwargs["frequencies"], bin_edges)
+            assert len(wf["plus"]) == len(bin_edges)
+
+            sequence.reset_mock()
+            wfg.waveform_arguments["fiducial"] = 1
+            wf = wfg.frequency_domain_strain(self._bbh_parameters)
+            sequence.assert_not_called()
+        assert len(wf["plus"]) == len(wfg.frequency_array)
+
+    def test_frequency_sequence_requires_gwsignal_support(self):
+        wfg = self.get_wfgen(
+            spinning=False,
+            waveform_arguments=dict(waveform_approximant="IMRPhenomD", frequencies=np.array([20.0, 30.0])),
+        )
+        without_sequence = {"lalsimulation.gwsignal": mock.Mock(spec=[])}
+        with mock.patch.dict("sys.modules", without_sequence):
+            with self.assertRaisesRegex(ImportError, "GenerateFDWaveformSequence"):
+                wfg.frequency_domain_strain(self._bbh_parameters)
+
+    def test_extra_source_parameters_are_passed_to_gwsignal(self):
+        from astropy import units as u
+
+        wfg = self.get_wfgen(
+            spinning=False,
+            extra_source_parameters=["TidalOctupolarLambda1", "TidalOctupolarLambda2"],
+        )
+        gwsignal_dict = wfg._from_bilby_parameters(
+            **self._bbh_parameters,
+            TidalOctupolarLambda1=500.0,
+            TidalHexadecapolarLambda1=100.0,
+        )
+        assert gwsignal_dict["TidalOctupolarLambda1"] == 500.0 * u.dimensionless_unscaled
+        assert "TidalOctupolarLambda2" not in gwsignal_dict
+        assert "TidalHexadecapolarLambda1" not in gwsignal_dict
+
+    def test_extra_source_parameters_mapping(self):
+        wfg = self.get_wfgen(spinning=False, extra_source_parameters=dict(lambda_3_1="TidalOctupolarLambda1"))
+        gwsignal_dict = wfg._from_bilby_parameters(**self._bbh_parameters, lambda_3_1=500.0)
+        assert "lambda_3_1" not in gwsignal_dict
+        assert gwsignal_dict["TidalOctupolarLambda1"].value == 500.0
+
+    def test_fixed_gwsignal_parameters_get_units(self):
+        wfg = self.get_wfgen(spinning=False, waveform_approximant="IMRPhenomD")
+        wfg_fixed = self.get_wfgen(
+            spinning=False,
+            waveform_arguments=dict(waveform_approximant="IMRPhenomD", TidalOctupolarLambda1=500.0),
+        )
+        wf = wfg.frequency_domain_strain(self._bbh_parameters)
+        wf_fixed = wfg_fixed.frequency_domain_strain(self._bbh_parameters)
+        np.testing.assert_array_equal(wf["plus"], wf_fixed["plus"])
+
+    def test_extra_source_parameters_in_meta_data(self):
+        assert "extra_source_parameters" not in self.get_wfgen().meta_data
+        wfg = self.get_wfgen(extra_source_parameters=["TidalOctupolarLambda1"])
+        assert wfg.meta_data["extra_source_parameters"] == dict(TidalOctupolarLambda1="TidalOctupolarLambda1")
+        new_wfg = self.get_wfgen(**wfg.meta_data)
+        assert new_wfg.extra_source_parameters == wfg.extra_source_parameters
+
 
 if __name__ == "__main__":
     unittest.main()

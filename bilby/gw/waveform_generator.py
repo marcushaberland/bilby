@@ -1,3 +1,5 @@
+from functools import partial
+
 import numpy as np
 
 from ..core import utils
@@ -301,6 +303,10 @@ class GWSignalWaveformGenerator(WaveformGenerator):
     This wrapper allows sets of parameters to be enabled/disabled.
     When, e.g., :code:`spinning=False` all spin parameters will be fixed to zero.
 
+    With the multibanding and relative binning likelihoods, the waveform is evaluated
+    at the frequencies they request with :code:`GenerateFDWaveformSequence`, which the
+    gwsignal generator must support.
+
     Parameters
     ==========
     spinning: bool
@@ -309,6 +315,11 @@ class GWSignalWaveformGenerator(WaveformGenerator):
         Whether to model orbital eccentricity (default=False)
     tidal: bool
         Whether to model tidal deformability of the individual objects (default=False)
+    extra_source_parameters: list or dict, optional
+        Further parameters to pass to gwsignal, as a list of gwsignal parameter names
+        or as a dict mapping bilby names to gwsignal names, in the units of gwsignal's
+        parameter conventions. A listed parameter that is neither sampled nor fixed is
+        not passed to gwsignal.
     sampling_frequency: float, optional
         The sampling frequency
     duration: float, optional
@@ -330,10 +341,13 @@ class GWSignalWaveformGenerator(WaveformGenerator):
 
     generator_pickles = False
 
-    def __init__(self, spinning=True, eccentric=False, tidal=False, **kwargs):
+    def __init__(self, spinning=True, eccentric=False, tidal=False, extra_source_parameters=None, **kwargs):
         self.spinning = spinning
         self.tidal = tidal
         self.eccentric = eccentric
+        if isinstance(extra_source_parameters, (list, tuple, set)):
+            extra_source_parameters = {key: key for key in extra_source_parameters}
+        self.extra_source_parameters = dict(extra_source_parameters or {})
         super().__init__(**kwargs)
         self.waveform_approximant = self.waveform_arguments["waveform_approximant"]
         self.generator = self._create_generator()
@@ -373,17 +387,21 @@ class GWSignalWaveformGenerator(WaveformGenerator):
             f"sampling_frequency={self.sampling_frequency}, start_time={self.start_time}, "
             f"parameter_conversion={param_conv_name}, "
             f"waveform_arguments={self.waveform_arguments}, "
-            f"spinning={self.spinning}, eccentric={self.eccentric}, tidal={self.tidal}"
+            f"spinning={self.spinning}, eccentric={self.eccentric}, tidal={self.tidal}, "
+            f"extra_source_parameters={self.extra_source_parameters}"
             ")"
         )
 
     @property
     def meta_data(self):
-        return dict(
+        meta_data = dict(
             spinning=self.spinning,
             eccentric=self.eccentric,
             tidal=self.tidal,
         )
+        if self.extra_source_parameters:
+            meta_data["extra_source_parameters"] = self.extra_source_parameters
+        return meta_data
 
     @property
     def defaults(self):
@@ -401,11 +419,12 @@ class GWSignalWaveformGenerator(WaveformGenerator):
     def _from_bilby_parameters(self, **parameters):
         from .conversion import bilby_to_lalsimulation_spins
 
+        parameters = {**dict.fromkeys(self.extra_source_parameters), **parameters}
         parameters = self._format_parameters(parameters)
 
         waveform_kwargs = dict(
             reference_frequency=50.0,
-            minimum_frequency=20.0,
+            minimum_frequency=self._default_minimum_frequency(),
             maximum_frequency=self.frequency_array[-1],
             mode_array=None,
             pn_amplitude_order=0,
@@ -496,18 +515,33 @@ class GWSignalWaveformGenerator(WaveformGenerator):
                 "pn_tidal_order",
                 "pn_phase_order",
                 "numerical_relativity_file",
+                "frequencies",
+                "frequency_bin_edges",
+                "fiducial",
         ]:
             if key in extra_args.keys():
                 del extra_args[key]
 
-        gwsignal_dict.update(extra_args)
+        for bilby_key, gwsignal_key in self.extra_source_parameters.items():
+            extra_args.pop(bilby_key, None)
+            if parameters[bilby_key] is not None:
+                extra_args[gwsignal_key] = parameters[bilby_key]
+
+        gwsignal_dict.update({
+            key: val << Cosmo_units_dictionary[key] if key in Cosmo_units_dictionary else val
+            for key, val in extra_args.items()
+        })
         return gwsignal_dict
 
     def frequency_domain_strain(self, parameters):
-        from lalsimulation.gwsignal import GenerateFDWaveform
-
         if parameters is None:
             parameters = self.parameters
+
+        frequencies = self._requested_frequencies()
+        if frequencies is not None:
+            return self._frequency_domain_strain_sequence(parameters, frequencies)
+
+        from lalsimulation.gwsignal import GenerateFDWaveform
 
         hpc = _try_waveform_call(
             GenerateFDWaveform,
@@ -520,12 +554,7 @@ class GWSignalWaveformGenerator(WaveformGenerator):
         if wf is None:
             return None
 
-        minimum_frequency = self.waveform_arguments.get("minimum_frequency", 20.0)
-        maximum_frequency = self.waveform_arguments.get("maximum_frequency", self.frequency_array[-1])
-        frequency_bounds = (
-            (self.frequency_array >= minimum_frequency)
-            * (self.frequency_array <= maximum_frequency)
-        )
+        frequency_bounds = self._frequency_bounds(self.frequency_array)
         for key in wf:
             wf[key] *= frequency_bounds
 
@@ -536,6 +565,50 @@ class GWSignalWaveformGenerator(WaveformGenerator):
                 wf[key][frequency_bounds] *= time_shift
 
         return wf
+
+    def _requested_frequencies(self):
+        if self.waveform_arguments.get("fiducial", 0) == 1:
+            return None
+        frequencies = self.waveform_arguments.get("frequencies")
+        if frequencies is None:
+            frequencies = self.waveform_arguments.get("frequency_bin_edges")
+        return frequencies
+
+    def _frequency_domain_strain_sequence(self, parameters, frequencies):
+        try:
+            from lalsimulation.gwsignal import GenerateFDWaveformSequence
+        except ImportError:
+            raise ImportError(
+                "The installed lalsimulation has no GenerateFDWaveformSequence, which the GWSignal "
+                "waveform generator needs for the multibanding and relative binning likelihoods."
+            )
+
+        hpc = _try_waveform_call(
+            partial(GenerateFDWaveformSequence, frequencies=frequencies),
+            self._from_bilby_parameters(**parameters),
+            self.generator,
+            self.waveform_arguments.get("catch_waveform_errors", False)
+        )
+        if hpc is None:
+            return None
+
+        frequency_bounds = self._frequency_bounds(frequencies)
+        return dict(
+            plus=np.asarray(hpc.hp.value) * frequency_bounds,
+            cross=np.asarray(hpc.hc.value) * frequency_bounds,
+        )
+
+    def _default_minimum_frequency(self):
+        frequencies = self.waveform_arguments.get("frequencies")
+        return 20.0 if frequencies is None else float(np.min(frequencies))
+
+    def _frequency_bounds(self, frequency_array):
+        minimum_frequency = self.waveform_arguments.get("minimum_frequency", self._default_minimum_frequency())
+        maximum_frequency = self.waveform_arguments.get("maximum_frequency", self.frequency_array[-1])
+        return (
+            (frequency_array >= minimum_frequency)
+            * (frequency_array <= maximum_frequency)
+        )
 
     def time_domain_strain(self, parameters):
         from lalsimulation.gwsignal import GenerateTDWaveform
@@ -598,7 +671,7 @@ class GWSignalWaveformGenerator(WaveformGenerator):
     }
 
     def _parameters_from_source_model(self):
-        return self._all_parameters.difference(self.defaults.keys())
+        return (self._all_parameters | set(self.extra_source_parameters)).difference(self.defaults.keys())
 
 
 def _try_waveform_call(func, parameters, generator, catch_waveform_errors):
