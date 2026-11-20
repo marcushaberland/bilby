@@ -8,6 +8,7 @@ from ..core.utils import PropertyAccessor
 from ..core.utils import logger
 from .conversion import convert_to_lal_binary_black_hole_parameters
 from .utils import lalsim_GetApproximantFromString
+from .utils import safe_cast_mode_to_int
 
 
 class WaveformGenerator(object):
@@ -499,6 +500,13 @@ class GWSignalWaveformGenerator(WaveformGenerator):
         }
 
         if mode_array is not None:
+            try:
+                mode_array = [tuple(map(safe_cast_mode_to_int, mode)) for mode in mode_array]
+            except (ValueError, TypeError) as e:
+                raise ValueError(
+                    f"Unable to convert mode_array elements to tuples of ints. "
+                    f"mode_array: {mode_array}, Error: {e}"
+                ) from e
             gwsignal_dict.update(ModeArray=mode_array)
 
         extra_args = waveform_kwargs.copy()

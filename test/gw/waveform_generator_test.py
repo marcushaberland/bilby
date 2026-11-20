@@ -1064,6 +1064,17 @@ class TestGWSignalGenerator(unittest.TestCase):
         new_wfg = self.get_wfgen(**wfg.meta_data)
         assert new_wfg.extra_source_parameters == wfg.extra_source_parameters
 
+    def test_mode_array_is_passed_as_tuples_of_ints(self):
+        wfg = self.get_wfgen(
+            spinning=False,
+            waveform_arguments=dict(waveform_approximant="IMRPhenomXHM", mode_array=[[2, 2], ["3", "3"]]),
+        )
+        gwsignal_dict = wfg._from_bilby_parameters(**self._bbh_parameters)
+        assert gwsignal_dict["ModeArray"] == [(2, 2), (3, 3)]
+        wfg.waveform_arguments["mode_array"] = [[2.0, 2.0]]
+        with self.assertRaisesRegex(ValueError, "Unable to convert mode_array"):
+            wfg._from_bilby_parameters(**self._bbh_parameters)
+
 
 if __name__ == "__main__":
     unittest.main()
