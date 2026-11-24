@@ -319,8 +319,10 @@ class GWSignalWaveformGenerator(WaveformGenerator):
     extra_source_parameters: list or dict, optional
         Further parameters to pass to gwsignal, as a list of gwsignal parameter names
         or as a dict mapping bilby names to gwsignal names, in the units of gwsignal's
-        parameter conventions. A listed parameter that is neither sampled nor fixed is
-        not passed to gwsignal.
+        parameter conventions. They are passed as given, together with bilby's
+        detector-frame masses, so a frequency in Hz (e.g. an f-mode frequency) is an
+        observed, detector-frame frequency. A listed parameter that is neither sampled
+        nor fixed is not passed to gwsignal.
     sampling_frequency: float, optional
         The sampling frequency
     duration: float, optional
